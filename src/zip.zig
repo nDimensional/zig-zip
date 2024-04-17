@@ -7,7 +7,6 @@ pub const CompressionMethod = enum(u16) {
 };
 
 // Local file header
-// https://en.wikipedia.org/wiki/ZIP_(file_format)#Local_file_header
 //
 // | Offset | Bytes | Description                                                      |
 // | ------ | ----- | ---------------------------------------------------------------- |
@@ -220,19 +219,27 @@ pub const Iterator = struct {
 
     pub const Entry = struct {
         name: []const u8,
+        size: usize,
         crc32: u32,
 
         compression_method: CompressionMethod,
         compressed_data: []const u8,
         decompressor: *std.compress.flate.Decompressor(Reader),
 
-        /// decompress returns the actual CRC-32 of the decompressed bytes,
-        /// which should be validated against the expected value entry.crc32
+        /// `decompress` returns the actual CRC-32 of the decompressed bytes,
+        /// which should be validated against the expected entry.crc32 value.
+        /// `writer` can be anything with a `writeAll(self: *Self, chunk: []const u8) anyerror!void` method.
         pub fn decompress(self: Entry, writer: anytype) !u32 {
             var hash = std.hash.Crc32.init();
 
             switch (self.compression_method) {
                 .store => {
+                    // var index: usize = 0;
+                    // while (index < self.compressed_data.len) {
+                    //     index += try writer.write(self.compressed_data[index..]);
+
+                    // }
+
                     const chunk_size = 4096;
 
                     var offset: usize = 0;
@@ -258,11 +265,12 @@ pub const Iterator = struct {
         }
     };
 
-    decompressor: std.compress.flate.Decompressor(Reader),
     map: []align(std.mem.page_size) const u8,
-    eocd: EndOfCentralDirectoryRecord,
-    central_directory_offset: u32,
-    n: u16,
+    central_directory: []const u8, // slice of `map`
+    record_count_total: u16,
+    record_byte_offset: u32, // current offset from the start of `central_directory`
+    record_index: u16,
+    decompressor: std.compress.flate.Decompressor(Reader),
 
     pub fn init(file: std.fs.File) !Iterator {
         const stat = try file.stat();
@@ -273,30 +281,51 @@ pub const Iterator = struct {
             return error.Invalid;
         }
 
-        // The EOCD record can technically contain a variable-length comment
-        // at the end, which makes ZIP file parsing ambiguous, since a valid
+        // The EOCD record can contain a variable-length comment at the end,
+        // which makes ZIP file parsing ambiguous in general, since a valid
         // comment could contain the bytes of another valid EOCD record.
-        // Comments are extremely rare in practice, so we only support parsing
-        // EOCD records with zero-length comments at the very end of the file.
+        // Here we just search backwards for the first instance of the EOCD
+        // signature, and return an error if a valid EOCD record doesn't follow.
+
+        var needle: [4]u8 = undefined;
+        std.mem.writeInt(u32, &needle, EndOfCentralDirectoryRecord.signature, .little);
+
+        var offset = std.mem.lastIndexOfLinear(u8, map, &needle) orelse return error.Invalid;
         var eocd: EndOfCentralDirectoryRecord = undefined;
-        _ = try eocd.read(map[map.len - 22 ..]);
+        offset += try eocd.read(map[offset..]);
 
-        // Don't support multi-disk archives
-        if (eocd.disk_number != 0 or eocd.central_directory_disk_number != 0) {
+        // The EOCD record must be located at the very end of the archive.
+        if (offset != map.len) {
             return error.Invalid;
         }
 
-        if (eocd.record_count_disk != eocd.record_count_total) {
+        // Don't support multi-disk archives.
+        if (eocd.disk_number != 0 or
+            eocd.central_directory_disk_number != 0 or
+            eocd.record_count_disk != eocd.record_count_total)
+        {
             return error.Invalid;
         }
+
+        const central_directory = locate_central_directory: {
+            const start = eocd.central_directory_offset;
+            const end = start + eocd.central_directory_size;
+            break :locate_central_directory map[start..end];
+        };
 
         // This empty stream is replaced using decompressor.setReader
-        // when actually called from File.decompress
-        const empty_buffer: []const u8 = &.{};
-        var stream = std.io.fixedBufferStream(empty_buffer);
+        // when actually called from Entry.decompress
+        var stream = std.io.fixedBufferStream(@as([]const u8, &.{}));
         const decompressor = std.compress.flate.decompressor(stream.reader());
 
-        return .{ .decompressor = decompressor, .map = map, .eocd = eocd, .central_directory_offset = 0, .n = 0 };
+        return .{
+            .map = map,
+            .central_directory = central_directory,
+            .record_count_total = eocd.record_count_total,
+            .record_byte_offset = 0,
+            .record_index = 0,
+            .decompressor = decompressor,
+        };
     }
 
     pub fn deinit(self: Iterator) void {
@@ -304,76 +333,103 @@ pub const Iterator = struct {
     }
 
     pub fn next(self: *Iterator) !?Entry {
-        if (self.n >= self.eocd.record_count_total or self.central_directory_offset >= self.eocd.central_directory_size) {
+        if (self.record_index >= self.record_count_total or self.record_byte_offset >= self.central_directory.len) {
             return null;
         }
 
-        const start = self.eocd.central_directory_offset + self.central_directory_offset;
-        if (start >= self.map.len) {
-            return error.Invalid;
-        }
-
         var header: CentralDirectoryFileHeader = undefined;
-        self.central_directory_offset += try header.read(self.map[start..]);
-        self.n += 1;
+        self.record_byte_offset += try header.read(self.central_directory[self.record_byte_offset..]);
+        self.record_index += 1;
 
         // Don't support multi-disk archives
         if (header.disk_number != 0) {
             return error.Invalid;
         }
 
-        var offset = header.local_file_header_offset;
-        if (offset >= self.map.len) {
+        var local_offset = header.local_file_header_offset;
+        if (local_offset >= self.map.len) {
             return error.Invalid;
         }
 
         var local_file_header: LocalFileHeader = undefined;
-        offset += try local_file_header.read(self.map[offset..]);
+        local_offset += try local_file_header.read(self.map[local_offset..]);
 
-        if (local_file_header.compressed_size != header.compressed_size) {
+        // The local file header duplicates the metadata for redundancy.
+        if (local_file_header.compressed_size != header.compressed_size or
+            local_file_header.uncompressed_size != header.uncompressed_size or
+            local_file_header.compression_method != header.compression_method or
+            local_file_header.crc32 != header.crc32)
+        {
             return error.Invalid;
         }
 
-        if (local_file_header.uncompressed_size != header.uncompressed_size) {
+        if (local_offset + header.compressed_size >= self.map.len) {
             return error.Invalid;
         }
 
-        if (local_file_header.compression_method != header.compression_method) {
-            return error.Invalid;
-        }
-
-        if (local_file_header.crc32 != header.crc32) {
-            return error.Invalid;
-        }
-
-        if (offset + header.compressed_size >= self.map.len) {
-            return error.Invalid;
-        }
-
-        const compressed_data = self.map[offset .. offset + header.compressed_size];
+        const compressed_data = self.map[local_offset .. local_offset + header.compressed_size];
 
         return .{
             .name = header.file_name,
+            .size = header.uncompressed_size,
             .crc32 = header.crc32,
 
-            .decompressor = &self.decompressor,
             .compression_method = header.compression_method,
             .compressed_data = compressed_data,
+            .decompressor = &self.decompressor,
         };
     }
 };
+
+const empty_crc32 = std.hash.Crc32.hash(&.{});
 
 pub fn pipeToFileSystem(dest: std.fs.Dir, source: std.fs.File) !void {
     var iter = try Iterator.init(source);
     defer iter.deinit();
 
     while (try iter.next()) |entry| {
-        const file = try dest.createFile(entry.name, .{});
-        defer file.close();
+        if (entry.name.len == 0) {
+            return error.Invalid;
+        }
 
-        const crc32 = try entry.decompress(file.writer());
-        if (crc32 != entry.crc32) {
-            return error.Corrupt;
+        if (std.mem.lastIndexOfScalar(u8, entry.name, '/')) |last_index| {
+            if (last_index == 0) {
+                return error.Invalid;
+            }
+
+            if (last_index == entry.name.len - 1) {
+                // Case 1: directory
+                // (directories in zip archives end in a trailing forward slash)
+                if (entry.size != 0) {
+                    return error.Invalid;
+                } else if (entry.crc32 != empty_crc32) {
+                    return error.Corrupt;
+                }
+
+                try dest.makePath(entry.name);
+            } else {
+                // Case 2: file inside a subdirectory
+                // (we can't assume that subdirectories are listed before their children)
+                var parent_dir = try dest.makeOpenPath(entry.name[0..last_index], .{});
+                defer parent_dir.close();
+
+                const file = try parent_dir.createFile(entry.name[last_index + 1 ..], .{});
+                defer file.close();
+
+                const crc32 = try entry.decompress(file.writer());
+                if (crc32 != entry.crc32) {
+                    return error.Corrupt;
+                }
+            }
+        } else {
+            // Case 3: top-level file
+            const file = try dest.createFile(entry.name, .{});
+            defer file.close();
+
+            const crc32 = try entry.decompress(file.writer());
+            if (crc32 != entry.crc32) {
+                return error.Corrupt;
+            }
         }
     }
 }
