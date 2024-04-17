@@ -69,12 +69,12 @@ fn testUnzip(allocator: std.mem.Allocator, entries: []const Entry) !void {
                 var leaf_dir = try source.makeOpenPath(entry.name[0..last_index], .{ .iterate = true });
                 defer leaf_dir.close();
 
-                const file = try leaf_dir.createFile(entry.name[last_index + 1 ..], .{});
+                const file = try leaf_dir.createFile(entry.name[last_index + 1 ..], .{ .exclusive = true });
                 defer file.close();
                 try file.writeAll(content);
             } else {
                 // add a root file
-                const file = try source.createFile(entry.name, .{});
+                const file = try source.createFile(entry.name, .{ .exclusive = true });
                 defer file.close();
                 try file.writeAll(content);
             }

@@ -1,5 +1,7 @@
 const std = @import("std");
 
+// https://pkwaredownloads.blob.core.windows.net/pem/APPNOTE.txt
+
 pub const CompressionMethod = enum(u16) {
     store = 0,
     deflate = 8,
@@ -263,6 +265,44 @@ pub const Iterator = struct {
 
             return hash.final();
         }
+
+        pub fn extract(self: Entry, dest: std.fs.Dir) !u32 {
+            if (self.name.len == 0 or self.name[0] == '/') {
+                return error.Invalid;
+            }
+
+            // Case 1: directory
+            // (directories in zip archives always end in a trailing forward slash)
+            if (self.name[self.name.len - 1] == '/') {
+                if (self.size != 0) {
+                    return error.Invalid;
+                }
+
+                try dest.makePath(self.name[0 .. self.name.len - 1]);
+                return std.hash.Crc32.hash(&.{});
+            }
+
+            // Case 2: file inside a subdirectory
+            // (we can't assume that subdirectories are listed before their children)
+            if (std.fs.path.dirname(self.name)) |dirname| {
+                var parent_dir = try dest.makeOpenPath(dirname, .{});
+                defer parent_dir.close();
+
+                const filename = std.fs.path.basename(self.name);
+                const file = try parent_dir.createFile(filename, .{ .exclusive = true });
+                defer file.close();
+
+                return try self.decompress(file.writer());
+            }
+
+            // Case 3: top-level file
+            {
+                const file = try dest.createFile(self.name, .{ .exclusive = true });
+                defer file.close();
+
+                return try self.decompress(file.writer());
+            }
+        }
     };
 
     map: []align(std.mem.page_size) const u8,
@@ -381,55 +421,14 @@ pub const Iterator = struct {
     }
 };
 
-const empty_crc32 = std.hash.Crc32.hash(&.{});
-
 pub fn pipeToFileSystem(dest: std.fs.Dir, source: std.fs.File) !void {
     var iter = try Iterator.init(source);
     defer iter.deinit();
 
     while (try iter.next()) |entry| {
-        if (entry.name.len == 0) {
-            return error.Invalid;
-        }
-
-        if (std.mem.lastIndexOfScalar(u8, entry.name, '/')) |last_index| {
-            if (last_index == 0) {
-                return error.Invalid;
-            }
-
-            if (last_index == entry.name.len - 1) {
-                // Case 1: directory
-                // (directories in zip archives end in a trailing forward slash)
-                if (entry.size != 0) {
-                    return error.Invalid;
-                } else if (entry.crc32 != empty_crc32) {
-                    return error.Corrupt;
-                }
-
-                try dest.makePath(entry.name);
-            } else {
-                // Case 2: file inside a subdirectory
-                // (we can't assume that subdirectories are listed before their children)
-                var parent_dir = try dest.makeOpenPath(entry.name[0..last_index], .{});
-                defer parent_dir.close();
-
-                const file = try parent_dir.createFile(entry.name[last_index + 1 ..], .{});
-                defer file.close();
-
-                const crc32 = try entry.decompress(file.writer());
-                if (crc32 != entry.crc32) {
-                    return error.Corrupt;
-                }
-            }
-        } else {
-            // Case 3: top-level file
-            const file = try dest.createFile(entry.name, .{});
-            defer file.close();
-
-            const crc32 = try entry.decompress(file.writer());
-            if (crc32 != entry.crc32) {
-                return error.Corrupt;
-            }
+        const crc32 = try entry.extract(dest);
+        if (crc32 != entry.crc32) {
+            return error.Corrupt;
         }
     }
 }
