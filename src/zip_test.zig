@@ -1,25 +1,6 @@
 const std = @import("std");
 const zip = @import("zip");
 
-fn createFile(dir: std.fs.Dir, name: []const u8, content: []const u8) !void {
-    if (std.mem.lastIndexOfScalar(u8, name, std.fs.path.sep)) |last_index| {
-        if (last_index == 0 or last_index == name.len - 1) {
-            return error.InvalidPath;
-        }
-
-        var leaf_dir = try dir.makeOpenPath(name[0..last_index], .{ .iterate = true });
-        defer leaf_dir.close();
-
-        const file = try leaf_dir.createFile(name[last_index + 1 ..], .{});
-        defer file.close();
-        try file.writeAll(content);
-    } else {
-        const file = try dir.createFile(name, .{});
-        defer file.close();
-        try file.writeAll(content);
-    }
-}
-
 /// only iterates over the entries of `expected`, so strict equality
 /// can be checked by calling this twice with reversed arguments.
 fn compareDirectories(expected: std.fs.Dir, actual: std.fs.Dir) !void {
@@ -61,7 +42,7 @@ fn compareFiles(expected: std.fs.File, actual: std.fs.File) !void {
     try std.testing.expectEqualSlices(u8, expected_map, actual_map);
 }
 
-const Entry = struct { name: []const u8, content: []const u8 };
+const Entry = struct { name: []const u8, content: ?[]const u8 };
 
 fn testUnzip(allocator: std.mem.Allocator, entries: []const Entry) !void {
     var tmp = std.testing.tmpDir(.{});
@@ -82,7 +63,25 @@ fn testUnzip(allocator: std.mem.Allocator, entries: []const Entry) !void {
     // for (entries) |entry| try argv.append(entry.name);
 
     for (entries) |entry| {
-        try createFile(source, entry.name, entry.content);
+        if (entry.content) |content| {
+            if (std.mem.lastIndexOfScalar(u8, entry.name, '/')) |last_index| {
+                // add a leaf file
+                var leaf_dir = try source.makeOpenPath(entry.name[0..last_index], .{ .iterate = true });
+                defer leaf_dir.close();
+
+                const file = try leaf_dir.createFile(entry.name[last_index + 1 ..], .{});
+                defer file.close();
+                try file.writeAll(content);
+            } else {
+                // add a root file
+                const file = try source.createFile(entry.name, .{});
+                defer file.close();
+                try file.writeAll(content);
+            }
+        } else {
+            // add a leaf directory
+            try source.makePath(entry.name);
+        }
     }
 
     {
@@ -117,7 +116,6 @@ fn testUnzip(allocator: std.mem.Allocator, entries: []const Entry) !void {
         try zip.pipeToFileSystem(dest, archive);
     }
 
-    // try source.deleteFile("archive.zip");
     try compareDirectories(source, dest);
     try compareDirectories(dest, source);
 }
@@ -157,5 +155,16 @@ test "many nested subdirectories" {
         .{ .name = "foo/foo.txt", .content = "foofoofoofoobarbarbarbarbazbazbazbaz" },
         .{ .name = "foo/bar/baz/alphabet.txt", .content = "abcdefghijklmnopqrstuvwxyz" },
         .{ .name = "foo/bar/foo.txt", .content = "foofoofoofoobarbarbarbarbazbazbazbaz" },
+    });
+}
+
+test "empty leaf directories" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+
+    try testUnzip(gpa.allocator(), &.{
+        .{ .name = "foo", .content = null },
+        .{ .name = "bar/baz", .content = null },
+        .{ .name = "bar/alphabet.txt", .content = "abcdefghijklmnopqrstuvwxyz" },
     });
 }
