@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const zip = @import("zip");
 
@@ -31,15 +32,13 @@ fn compareDirectories(expected: std.fs.Dir, actual: std.fs.Dir) !void {
 }
 
 fn compareFiles(expected: std.fs.File, actual: std.fs.File) !void {
-    const expected_stat = try expected.stat();
-    const expected_map = try std.posix.mmap(null, expected_stat.size, std.posix.PROT.READ, .{ .TYPE = .SHARED }, expected.handle, 0);
-    defer std.posix.munmap(expected_map);
+    const expected_map = try zip.MappedFile.init(expected, .{});
+    defer expected_map.unmap();
 
-    const actual_stat = try expected.stat();
-    const actual_map = try std.posix.mmap(null, actual_stat.size, std.posix.PROT.READ, .{ .TYPE = .SHARED }, actual.handle, 0);
-    defer std.posix.munmap(actual_map);
+    const actual_map = try zip.MappedFile.init(actual, .{});
+    defer actual_map.unmap();
 
-    try std.testing.expectEqualSlices(u8, expected_map, actual_map);
+    try std.testing.expectEqualSlices(u8, expected_map.mem, actual_map.mem);
 }
 
 const Entry = struct { name: []const u8, content: ?[]const u8 };
@@ -85,10 +84,30 @@ fn testUnzip(allocator: std.mem.Allocator, entries: []const Entry) !void {
     }
 
     {
+        var source_path_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+        const source_path = switch (builtin.os.tag) {
+            .windows => try source.realpath(".", &source_path_buf),
+            else => undefined,
+        };
+
+        const cmd = switch (builtin.os.tag) {
+            .windows => try std.fmt.allocPrint(
+                allocator,
+                "cd {s} && tar -a -c -f ..\\archive.zip .",
+                .{ source_path },
+            ),
+            else => &[_]u8{ },
+        };
+        defer allocator.free(cmd);
+
         const result = try std.ChildProcess.run(.{
             .allocator = allocator,
+            // cwd_dir doesn't seem to be supported on windows
             .cwd_dir = source,
-            .argv = &.{ "zip", "-r", "../archive.zip", ".", "-i", "*" },
+            .argv = switch (builtin.os.tag) {
+                .windows => &.{ "cmd", "/C", cmd },
+                else => &.{ "zip", "-r", "../archive.zip", ".", "-i", "*" },
+            },
         });
 
         // const stderr = std.io.getStdErr().writer();

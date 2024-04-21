@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const MappedFile = @import("MappedFile.zig");
 
 // https://pkwaredownloads.blob.core.windows.net/pem/APPNOTE.txt
 
@@ -305,7 +306,7 @@ pub const Iterator = struct {
         }
     };
 
-    map: []align(std.mem.page_size) const u8,
+    map: MappedFile,
     central_directory: []const u8, // slice of `map`
     record_count_total: u16,
     record_byte_offset: u32, // current offset from the start of `central_directory`
@@ -313,11 +314,11 @@ pub const Iterator = struct {
     decompressor: std.compress.flate.Decompressor(Reader),
 
     pub fn init(file: std.fs.File) !Iterator {
-        const stat = try file.stat();
-        const map = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
+        const map = try MappedFile.init(file, .{});
+        errdefer map.unmap();
 
         // 22 is minimum length of an empty ZIP archive.
-        if (map.len < 22) {
+        if (map.mem.len < 22) {
             return error.Invalid;
         }
 
@@ -330,12 +331,12 @@ pub const Iterator = struct {
         var needle: [4]u8 = undefined;
         std.mem.writeInt(u32, &needle, EndOfCentralDirectoryRecord.signature, .little);
 
-        var offset = std.mem.lastIndexOfLinear(u8, map, &needle) orelse return error.Invalid;
+        var offset = std.mem.lastIndexOfLinear(u8, map.mem, &needle) orelse return error.Invalid;
         var eocd: EndOfCentralDirectoryRecord = undefined;
-        offset += try eocd.read(map[offset..]);
+        offset += try eocd.read(map.mem[offset..]);
 
         // The EOCD record must be located at the very end of the archive.
-        if (offset != map.len) {
+        if (offset != map.mem.len) {
             return error.Invalid;
         }
 
@@ -350,7 +351,7 @@ pub const Iterator = struct {
         const central_directory = locate_central_directory: {
             const start = eocd.central_directory_offset;
             const end = start + eocd.central_directory_size;
-            break :locate_central_directory map[start..end];
+            break :locate_central_directory map.mem[start..end];
         };
 
         // This empty stream is replaced using decompressor.setReader
@@ -369,7 +370,7 @@ pub const Iterator = struct {
     }
 
     pub fn deinit(self: Iterator) void {
-        std.posix.munmap(self.map);
+        self.map.unmap();
     }
 
     pub fn next(self: *Iterator) !?Entry {
@@ -387,27 +388,34 @@ pub const Iterator = struct {
         }
 
         var local_offset = header.local_file_header_offset;
-        if (local_offset >= self.map.len) {
+        if (local_offset >= self.map.mem.len) {
             return error.Invalid;
         }
 
         var local_file_header: LocalFileHeader = undefined;
-        local_offset += try local_file_header.read(self.map[local_offset..]);
+        local_offset += try local_file_header.read(self.map.mem[local_offset..]);
 
         // The local file header duplicates the metadata for redundancy.
-        if (local_file_header.compressed_size != header.compressed_size or
+        if (
+            (
+                local_file_header.compressed_size != 0 and
+                local_file_header.compressed_size != header.compressed_size
+            ) or
             local_file_header.uncompressed_size != header.uncompressed_size or
             local_file_header.compression_method != header.compression_method or
-            local_file_header.crc32 != header.crc32)
-        {
+            (
+                local_file_header.crc32 != 0 and
+                local_file_header.crc32 != header.crc32
+            )
+        ) {
             return error.Invalid;
         }
 
-        if (local_offset + header.compressed_size >= self.map.len) {
+        if (local_offset + header.compressed_size >= self.map.mem.len) {
             return error.Invalid;
         }
 
-        const compressed_data = self.map[local_offset .. local_offset + header.compressed_size];
+        const compressed_data = self.map.mem[local_offset .. local_offset + header.compressed_size];
 
         return .{
             .name = header.file_name,
